@@ -1,0 +1,273 @@
+---
+title: "Medicaid Expansion State Exploration"
+output: html_document
+author: Anna Shafer
+---
+
+```{r setup, include = FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(scales)
+
+# SQL / DB
+library(DBI)
+library(duckdb)
+
+#API specific
+library(censusapi)
+
+# Modeling
+library(did) # Difference-in-Differences
+
+theme_set(theme_minimal(base_size = 12))
+options(dplyr.summarise.inform = FALSE)
+```
+
+"The Small Area Health Insurance Estimates (SAHIE) program was created to develop model-based estimates of health insurance coverage for counties and states." (quoted from https://www.census.gov/programs-surveys/sahie/data/api.html) The data runs from 2008 to 2023 and information about using the API for calls is available.
+
+We’ll start by using the census API to pull: **percent uninsured** for **ages 18–64**, **all incomes**, **both sexes**, **all races**, state level only.
+
+```{r get-sahie}
+# Optional: use a key if making a lot of (more than 500) calls per day
+# key <- Sys.getenv("CENSUS_KEY", unset = NA)
+
+raw <- getCensus(
+  name   = "timeseries/healthins/sahie",
+  vars   = c("YEAR","STABREV","STATE","NAME","PCTUI_PT","AGECAT","IPRCAT","SEXCAT","RACECAT"),
+  region = "state:*",
+  time   = "from 2008 to 2023"
+)
+
+sahie <- raw %>%
+  as_tibble() %>%
+  clean_names() %>%
+  filter(agecat == "1", iprcat == "0", sexcat == "0", racecat == "0") %>%  # 18–64, all incomes, both sexes, all races
+  transmute(
+    year         = as.integer(year),
+    state_fips   = state,
+    state        = stabrev,
+    state_name   = name,
+    pct_unins    = as.numeric(pctui_pt)
+  ) %>%
+  arrange(state, year)
+
+glimpse(sahie)
+```
+Now let's do a sanity check that we have all the states
+
+```{r duckdb-load, message=FALSE}
+con <- dbConnect(duckdb(), dbdir = "../data/sahie.duckdb", read_only = FALSE)
+dbWriteTable(con, "sahie", sahie, overwrite = TRUE)
+
+# Quick SQL sanity checks
+dbGetQuery(con, "
+  SELECT year, COUNT(*) AS n_states, AVG(pct_unins) AS avg_unins
+  FROM sahie
+  GROUP BY year
+  ORDER BY year
+  LIMIT 5
+")
+```
+
+Okay, this is including DC, which we can drop since we are looking at states only for this analysis.
+
+```{r filter}
+all_states <- tibble(state = state.abb) |>
+  filter(state != "DC") # keep to 50 states; drop DC
+```
+
+Now let's look at expansion timelines. Most expansions began in 2014, with notable late adopters.
+
+```{r expansion-table}
+nonexpansion <- c("AL","FL","GA","KS","MS","SC","TN","TX","WI","WY")  # as of Aug 26, 2025
+
+#WI and GA are partial expansion states... but do not qualify for full federal expansion
+#https://www.healthinsurance.org/glossary/medicaid-expansion/
+
+# For the rest, assign the year of expansion
+late_adopters <- tribble(
+  ~state, ~exp_year,
+  "IN", 2015, #HIP has some modifications
+  "PA", 2015,
+  "AK", 2015,
+  "MT", 2016, #could end in 2025?
+  "LA", 2016,
+  "VA", 2019, #started end of 2018, coverage took effect 2019
+  "ME", 2019, #messy... we'll say 2019
+  "ID", 2020,
+  "UT", 2020, #started partial in 2019... we'll keep it at 2020
+  "NE", 2020,
+  "OK", 2021,
+  "MO", 2021,
+  "SD", 2023,
+  "NC", 2023
+)
+
+# all other states adoped per default in 2014
+expanded_default_2014 <- all_states %>%
+  anti_join(tibble(state = nonexpansion), by = "state") %>%
+  anti_join(late_adopters, by = "state") %>%
+  mutate(exp_year = 2014)
+
+expansion_years <- bind_rows(expanded_default_2014, late_adopters) %>%
+  mutate(expanded_ever = TRUE) %>%
+  bind_rows(tibble(state = nonexpansion, exp_year = NA, expanded_ever = FALSE))
+
+# Save in DB
+dbWriteTable(con, "expansion_years", expansion_years, overwrite = TRUE)
+
+# join with SAHIE percent insured data
+panel <- dbGetQuery(con, "
+  SELECT s.year, s.state, s.state_name, s.pct_unins,
+         e.exp_year, e.expanded_ever
+  FROM sahie s LEFT JOIN expansion_years e
+  USING(state)
+")
+
+```
+
+Let's look at the overall trends by expansion vs. non-expansion
+
+```{r eda-summaries}
+eda <- panel %>%
+  mutate(group = if_else(expanded_ever, "Expansion states", "Non-expansion")) %>%
+  group_by(group, year) %>%
+  summarise(avg_uninsured = mean(pct_unins, na.rm = TRUE), .groups = "drop")
+
+ggplot(eda, aes(year, avg_uninsured, linetype = group)) +
+  geom_line(linewidth = 0.9) +
+  labs(title = "Average uninsured rate (ages 18–64), SAHIE",
+       subtitle = "Expansion vs. non-expansion states",
+       x = NULL, y = "Percent uninsured") +
+  scale_y_continuous(labels = percent_format(scale = 1))
+
+```
+Interesting that the states that have expanded in some form had lower uninsured rates even before 2014.
+
+Let's dive a little deeper in per state.
+
+```{r eda-facets, fig.height=9, fig.width=12}
+panel %>%
+  ggplot(aes(year, pct_unins, group = state)) +
+  geom_line() +
+  facet_wrap(~state, ncol = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks=c(2008,2014,2020))  +
+  theme(
+    panel.grid.major = element_line(color = "grey80", size = 0.5), # Customize major grid lines
+    panel.grid.minor = element_blank() )+
+  labs(title = "Percent uninsured by state (ages 18–64)", y = "Percent uninsured")
+
+
+```
+We can see that there is a lot of baseline variability among the states and that many dropped their uninsured rate drastically in 2014. FL and OK have notable post 2020 drops in uninsured rates also but overall these changes are less pronounced.
+
+<!-- *The same aggregation in pure SQL:** -->
+<!-- ```{r sql-eda} -->
+<!-- dbGetQuery(con, " -->
+<!--   WITH flag AS ( -->
+<!--     SELECT state, CASE WHEN expanded_ever THEN 'Expansion states' ELSE 'Non-expansion' END AS grp -->
+<!--     FROM expansion_years -->
+<!--   ) -->
+<!--   SELECT s.year, f.grp, AVG(s.pct_unins) AS avg_uninsured -->
+<!--   FROM sahie s -->
+<!--   JOIN flag f USING(state) -->
+<!--   GROUP BY 1,2 -->
+<!--   ORDER BY 1,2 -->
+<!-- ") %>% head() -->
+<!-- ``` -->
+
+Okay, now let's start to model this and see if there is a difference between expansion and on-expansion states based on year of adoption. We’ll use a Difference-in-Differences (DiD) design to allow us to evaluate the differences in expansion ("treatment") timing. https://cran.r-project.org/web/packages/did/vignettes/did-basics.html
+
+```{r prep model}
+dat <- panel %>%
+  filter(!is.na(pct_unins)) %>%
+  mutate(
+    # treatment indicator for staggered DiD
+    treat_post = if_else(expanded_ever & !is.na(exp_year) & year >= exp_year, 1, 0, 0),
+    rel_time = if_else(!is.na(g), year - g, NA_integer_),
+    year = as.integer(year),
+    stateID = as.numeric(as.factor(state)),
+    exp_year = replace_na(exp_year, 0))
+max(dat$year)
+```
+
+```{r}
+
+m.did<-att_gt(yname = "pct_unins", gname = "exp_year", idname = "stateID",
+                   tname = "year", xformla = ~1, data = dat,)
+summary(m.did)
+m.dyn <- aggte(m.did, type = "dynamic")
+summary(m.dyn)
+ggdid(m.dyn)+
+  labs(title = "Effect of Medicaid expansion on uninsured rate (ages 18–64), SAHIE",
+       subtitle = "Average effect across states, races, income levels",
+       x = "Time relative to Expansion (years)", y = "Group-time average treatment effect")
+```
+Now let's test if the effect is different for lower income brackets. We'll target the population at or below 138% FPL (the expansion threshold).
+
+```{r get-sahie-irp3}
+
+sahie_irp3 <- raw %>%
+  as_tibble() %>%
+  clean_names() %>%
+  filter(agecat == "1", iprcat == "3", sexcat == "0", racecat == "0") %>%  # 18–64, all incomes, both sexes, all races
+  transmute(
+    year         = as.integer(year),
+    state_fips   = state,
+    state        = stabrev,
+    state_name   = name,
+    pct_unins    = as.numeric(pctui_pt)
+  ) %>%
+  arrange(state, year)
+
+glimpse(sahie_irp3)
+```
+
+```{r clean-up, message=FALSE}
+dbWriteTable(con, "sahie_irp3", sahie_irp3, overwrite = TRUE)
+
+# re-join the categorical groupings with sahie_irp3
+panel_irp3 <- dbGetQuery(con, "
+  SELECT s.year, s.state, s.state_name, s.pct_unins,
+         e.exp_year, e.expanded_ever
+  FROM sahie_irp3 s LEFT JOIN expansion_years e
+  USING(state)
+")
+
+dat_irp3 <- panel_irp3 %>%
+  filter(!is.na(pct_unins)) %>%
+  mutate(
+    # treatment indicator for staggered DiD
+    treat_post = if_else(expanded_ever & !is.na(exp_year) & year >= exp_year, 1, 0, 0),
+    rel_time = if_else(!is.na(exp_year), year - exp_year, NA_integer_),
+    year = as.integer(year),
+    stateID = as.numeric(as.factor(state)),
+    exp_year = replace_na(exp_year, 0))
+
+head(dat_irp3,10)
+```
+```{r did-model_irp3}
+m.did_irp3<-att_gt(yname = "pct_unins", gname = "exp_year", idname = "stateID",
+                   tname = "year", xformla = ~1, data = dat_irp3,)
+summary(m.did)
+m.dyn_irp3 <- aggte(m.did_irp3, type = "dynamic")
+summary(m.dyn_irp3)
+ggdid(m.dyn_irp3) +
+  labs(title = "Effect of Medicaid expansion on uninsured rate (ages 18–64), SAHIE",
+       subtitle = "Average effect across states, races, income levels",
+       x = "Time relative to Expansion (years)", y = "Group-time average treatment effect")
+```
+So we see a similar trend but much greater significance that carries over for 8 years after expansion instead of 5 for the lower income bracket.
+
+Future improvements could include:
+- adding in month level granularity for the expansion timing and/or removing ambiguous states such as GA and WI and checking the robustness of the model.
+- including a population weighting to see the impact per average person rather than state.
+- could expand to county level modeling to better reflect states heterogeneity both of need and current rates.
+
+To really draw impactful conclusions from this, additional covariates would be helpful. For example, adding in the rate of chronic diseases per state and seeing if there were changes to those rates in states that showed a significant change in the uninsured rate.
+
+```{r cleanup}
+con.close()
+```
