@@ -163,21 +163,6 @@ panel %>%
 ```
 We can see that there is a lot of baseline variability among the states and that many dropped their uninsured rate drastically in 2014. FL and OK have notable post 2020 drops in uninsured rates also but overall these changes are less pronounced.
 
-<!-- *The same aggregation in pure SQL:** -->
-<!-- ```{r sql-eda} -->
-<!-- dbGetQuery(con, " -->
-<!--   WITH flag AS ( -->
-<!--     SELECT state, CASE WHEN expanded_ever THEN 'Expansion states' ELSE 'Non-expansion' END AS grp -->
-<!--     FROM expansion_years -->
-<!--   ) -->
-<!--   SELECT s.year, f.grp, AVG(s.pct_unins) AS avg_uninsured -->
-<!--   FROM sahie s -->
-<!--   JOIN flag f USING(state) -->
-<!--   GROUP BY 1,2 -->
-<!--   ORDER BY 1,2 -->
-<!-- ") %>% head() -->
-<!-- ``` -->
-
 Okay, now let's start to model this and see if there is a difference between expansion and on-expansion states based on year of adoption. We’ll use a Difference-in-Differences (DiD) design to allow us to evaluate the differences in expansion ("treatment") timing. https://cran.r-project.org/web/packages/did/vignettes/did-basics.html
 
 ```{r prep model}
